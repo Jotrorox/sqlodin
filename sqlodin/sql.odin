@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 
+// Note to self: please don't forget this is in big endian format
 sqlite_header :: struct {
 	header_string:                 [16]u8,
 	page_size:                     u16,
@@ -30,6 +31,18 @@ sqlite_header :: struct {
 	sqlite_version_number:         u32,
 }
 
+sqlite_db :: struct {
+	file_path: string,
+	page_size: u16,
+}
+
+DATABASE_READ_ERROR :: enum {
+	NONE                = 0,
+	FILE_NOT_FOUND      = 1,
+	INVALID_FILE_FORMAT = 2,
+	IO_ERROR            = 3,
+}
+
 header_parse :: proc(data: ^[100]u8) -> ^sqlite_header {
 	header_ptr := new(sqlite_header, context.allocator)
 	mem.copy(header_ptr, data, size_of(sqlite_header))
@@ -42,22 +55,18 @@ header_cleanup :: #force_inline proc(header_ptr: ^sqlite_header) {
 	}
 }
 
-main :: proc() {
-	if len(os.args) < 2 {
-		fmt.println("Usage: sqlodin <database_file>")
-		return
-	}
-	if len(os.args) > 2 {
-		fmt.println("Error: Too many arguments")
-		return
-	}
+read :: proc {
+	read_file,
+}
 
-	file_name := os.args[1]
+read_file :: proc(file_path: string) -> (^sqlite_db, DATABASE_READ_ERROR) {
+	db_ptr := new(sqlite_db, context.allocator)
+	db_ptr.file_path = file_path
 
-	file_handle, file_open_err := os.open(file_name)
+	file_handle, file_open_err := os.open(file_path)
 	if file_open_err != nil {
 		fmt.println("Error opening file:", file_open_err)
-		return
+		return nil, DATABASE_READ_ERROR.FILE_NOT_FOUND
 	}
 	defer os.close(file_handle)
 
@@ -65,19 +74,17 @@ main :: proc() {
 	total_read, read_err := os.read(file_handle, header[:])
 	if read_err != nil {
 		fmt.println("Error reading file:", read_err)
-		return
+		return nil, DATABASE_READ_ERROR.IO_ERROR
 	}
 
 	if total_read < len(header) {
 		fmt.println("Error: Incomplete header read")
-		return
+		return nil, DATABASE_READ_ERROR.IO_ERROR
 	}
 
 	header_ptr := header_parse(&header)
 	defer header_cleanup(header_ptr)
 
-	fmt.println("Total bytes read:", total_read)
-	fmt.println("File header data:", header_ptr^.header_string)
-	page_size_be := (u16(header[16]) << 8) | u16(header[17])
-	fmt.println("Page size:", page_size_be)
+	db_ptr.page_size = (u16(header[16]) << 8) | u16(header[17])
+	return db_ptr, DATABASE_READ_ERROR.NONE
 }
