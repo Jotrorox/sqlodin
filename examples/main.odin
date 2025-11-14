@@ -23,4 +23,13 @@ main :: proc() {
 	}
 
 	fmt.println("Page size:", db_ptr^.page_size)
+
+	page_number: u32 = 0
+	page_data, page_read_err := sqlodin.read_page(db_ptr, page_number)
+	if page_read_err != sqlodin.PAGE_READ_ERROR.NONE {
+		fmt.println("Error reading page:", page_read_err)
+		return
+	}
+
+	fmt.println("Page data:", page_data)
 }

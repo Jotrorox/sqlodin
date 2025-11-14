@@ -23,7 +23,6 @@ SQLITE_MAGIC: [16]u8 = {
 	0x00,
 }
 
-// Note to self: please don't forget this is in big endian format
 sqlite_header :: struct {
 	header_string:                 [16]u8,
 	page_size:                     u16,
@@ -51,9 +50,8 @@ sqlite_header :: struct {
 }
 
 sqlite_db :: struct {
-	file_path:       string,
-	page_size:       u16,
-	page_size_bytes: u32,
+	file_path: string,
+	page_size: u32,
 }
 
 DATABASE_READ_ERROR :: enum {
@@ -186,6 +184,44 @@ header_cleanup :: #force_inline proc(header_ptr: ^sqlite_header) {
 	}
 }
 
+open_db_file :: #force_inline proc(db_ptr: ^sqlite_db) -> (os.Handle, DATABASE_READ_ERROR) {
+	file, open_file_err := os.open(db_ptr^.file_path)
+	if open_file_err != nil {
+		return file, DATABASE_READ_ERROR.FILE_NOT_FOUND
+	}
+	return file, DATABASE_READ_ERROR.NONE
+}
+
+PAGE_READ_ERROR :: enum {
+	NONE,
+	FILE_NOT_FOUND,
+	READ_ERROR,
+	INVALID_PAGE_SIZE,
+}
+
+read_page :: proc(db_ptr: ^sqlite_db, page_number: u32) -> ([]byte, PAGE_READ_ERROR) {
+	page_size := db_ptr^.page_size
+	page_offset := page_number * page_size + 100 // Offset because of header
+	page_data := make([]byte, page_size)
+
+	file_handle, open_file_err := open_db_file(db_ptr)
+	defer os.close(file_handle)
+	if open_file_err != nil {
+		return nil, PAGE_READ_ERROR.FILE_NOT_FOUND
+	}
+
+	total_read, read_err := os.read_at(file_handle, page_data, i64(page_offset))
+	if read_err != nil {
+		return nil, PAGE_READ_ERROR.READ_ERROR
+	}
+
+	if total_read < len(page_data) {
+		return nil, PAGE_READ_ERROR.INVALID_PAGE_SIZE
+	}
+
+	return page_data, PAGE_READ_ERROR.NONE
+}
+
 read :: proc {
 	read_file,
 }
@@ -194,10 +230,9 @@ read_file :: proc(file_path: string) -> (^sqlite_db, DATABASE_READ_ERROR) {
 	db_ptr := new(sqlite_db, context.allocator)
 	db_ptr.file_path = file_path
 
-	file_handle, file_open_err := os.open(file_path)
+	file_handle, open_file_err := os.open(file_path)
 	defer os.close(file_handle)
-	if file_open_err != nil {
-		fmt.println("Error opening file:", file_open_err)
+	if open_file_err != nil {
 		return nil, DATABASE_READ_ERROR.FILE_NOT_FOUND
 	}
 
@@ -224,7 +259,6 @@ read_file :: proc(file_path: string) -> (^sqlite_db, DATABASE_READ_ERROR) {
 		return nil, DATABASE_READ_ERROR.INVALID_FILE_FORMAT
 	}
 
-	db_ptr.page_size = header_ptr^.page_size
-	db_ptr.page_size_bytes = resolved_page_size
+	db_ptr.page_size = resolved_page_size
 	return db_ptr, DATABASE_READ_ERROR.NONE
 }
