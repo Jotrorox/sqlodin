@@ -1,6 +1,6 @@
 package main
 
-import sqlodin "../sqlodin"
+import sqlodin "../../sqlodin"
 import "core:fmt"
 import "core:os"
 
@@ -32,32 +32,19 @@ main :: proc() {
 	fmt.println("Tables:", tables)
 	for table in tables {
 		fmt.println("Data for table:", table)
-		rows, cols, err := sqlodin.query_table(db_ptr, table)
-		if err != sqlodin.DATABASE_READ_ERROR.NONE {
-			fmt.println("Error querying table:", err)
+		result := sqlodin.query_table(db_ptr, table)
+		defer sqlodin.destroy_query_result(result)
+
+		if result.err != sqlodin.DATABASE_READ_ERROR.NONE {
+			fmt.println("Error querying table:", result.err)
 			delete(table)
 			continue
 		}
 
-		fmt.println("    Columns:", cols)
-		for row in rows {
+		fmt.println("    Columns:", result.columns)
+		for row in result.rows {
 			fmt.println("   ", row)
-			for _, v in row {
-				#partial switch val in v {
-				case string:
-					delete(val)
-				case []byte:
-					delete(val)
-				}
-			}
-			delete(row)
 		}
-		delete(rows)
-
-		for col in cols {
-			delete(col)
-		}
-		delete(cols)
 
 		delete(table)
 	}

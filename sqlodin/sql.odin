@@ -5,6 +5,7 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 
+@(private = "file")
 SQLITE_MAGIC: [16]u8 = {
 	0x53,
 	0x51,
@@ -24,6 +25,7 @@ SQLITE_MAGIC: [16]u8 = {
 	0x00,
 }
 
+@(private = "file")
 sqlite_header :: struct {
 	header_string:                 [16]u8,
 	page_size:                     u16,
@@ -62,6 +64,7 @@ DATABASE_READ_ERROR :: enum {
 	IO_ERROR            = 3,
 }
 
+@(private = "file")
 HEADER_PARSE_ERROR :: enum {
 	NONE           = 0,
 	INVALID_HEADER = 1,
@@ -70,6 +73,7 @@ HEADER_PARSE_ERROR :: enum {
 	ALLOC_ERROR    = 4,
 }
 
+@(private)
 PAGE_READ_ERROR :: enum {
 	NONE,
 	FILE_NOT_FOUND,
@@ -77,10 +81,12 @@ PAGE_READ_ERROR :: enum {
 	INVALID_PAGE_SIZE,
 }
 
+@(private = "file")
 be_read_u16 :: #force_inline proc(bytes: []u8, offset: int) -> u16 {
 	return (u16(bytes[offset]) << 8) | u16(bytes[offset + 1])
 }
 
+@(private = "file")
 be_read_u32 :: #force_inline proc(bytes: []u8, offset: int) -> u32 {
 	return(
 		(u32(bytes[offset]) << 24) |
@@ -90,6 +96,7 @@ be_read_u32 :: #force_inline proc(bytes: []u8, offset: int) -> u32 {
 	)
 }
 
+@(private = "file")
 derive_page_size :: #force_inline proc(raw: u16) -> (u32, bool) {
 	if raw == 0 {
 		return 0, false
@@ -106,6 +113,7 @@ derive_page_size :: #force_inline proc(raw: u16) -> (u32, bool) {
 	return u32(raw), true
 }
 
+@(private = "file")
 header_parse :: proc(data: ^[100]u8) -> (^sqlite_header, HEADER_PARSE_ERROR) {
 	if data == nil {
 		return nil, HEADER_PARSE_ERROR.INVALID_HEADER
@@ -186,12 +194,14 @@ header_parse :: proc(data: ^[100]u8) -> (^sqlite_header, HEADER_PARSE_ERROR) {
 	return header_ptr, HEADER_PARSE_ERROR.NONE
 }
 
+@(private = "file")
 header_cleanup :: #force_inline proc(header_ptr: ^sqlite_header) {
 	if header_ptr != nil {
 		mem.free(header_ptr)
 	}
 }
 
+@(private = "file")
 open_db_file :: #force_inline proc(db_ptr: ^sqlite_db) -> (os.Handle, DATABASE_READ_ERROR) {
 	file, open_file_err := os.open(db_ptr^.file_path)
 	if open_file_err != nil {
@@ -200,6 +210,7 @@ open_db_file :: #force_inline proc(db_ptr: ^sqlite_db) -> (os.Handle, DATABASE_R
 	return file, DATABASE_READ_ERROR.NONE
 }
 
+@(private)
 read_page :: proc(db_ptr: ^sqlite_db, page_number: u32) -> ([]byte, PAGE_READ_ERROR) {
 	page_size := db_ptr^.page_size
 	if page_number < 1 {
@@ -230,6 +241,7 @@ read :: proc {
 	read_file,
 }
 
+@(private)
 read_file :: proc(file_path: string) -> (^sqlite_db, DATABASE_READ_ERROR) {
 	db_ptr := new(sqlite_db, context.allocator)
 	db_ptr.file_path = file_path
@@ -267,6 +279,7 @@ read_file :: proc(file_path: string) -> (^sqlite_db, DATABASE_READ_ERROR) {
 	return db_ptr, DATABASE_READ_ERROR.NONE
 }
 
+@(private = "file")
 read_varint :: proc(data: []byte, offset: int) -> (u64, int) {
 	val: u64 = 0
 	for i := 0; i < 8; i += 1 {
@@ -286,6 +299,7 @@ read_varint :: proc(data: []byte, offset: int) -> (u64, int) {
 	return val, 9
 }
 
+@(private = "file")
 serial_type_len :: proc(serial_type: u64) -> u64 {
 	switch serial_type {
 	case 0, 8, 9:
@@ -387,6 +401,52 @@ SqlValue :: union {
 	[]byte,
 }
 
+Row :: map[string]SqlValue
+
+QueryResult :: struct {
+	rows:    [dynamic]Row,
+	columns: []string,
+	err:     DATABASE_READ_ERROR,
+}
+
+destroy_query_result :: proc(result: QueryResult) {
+	for row in result.rows {
+		for _, v in row {
+			#partial switch val in v {
+			case string:
+				delete(val)
+			case []byte:
+				delete(val)
+			}
+		}
+		delete(row)
+	}
+	delete(result.rows)
+	for col in result.columns {
+		delete(col)
+	}
+	delete(result.columns)
+}
+
+row_get_int :: proc(row: Row, col: string) -> (i64, bool) {
+	val, ok := row[col]
+	if !ok {
+		return 0, false
+	}
+	res, is_int := val.(i64)
+	return res, is_int
+}
+
+row_get_str :: proc(row: Row, col: string) -> (string, bool) {
+	val, ok := row[col]
+	if !ok {
+		return "", false
+	}
+	res, is_str := val.(string)
+	return res, is_str
+}
+
+@(private = "file")
 TableSchema :: struct {
 	type:      string,
 	name:      string,
@@ -395,6 +455,7 @@ TableSchema :: struct {
 	sql:       string,
 }
 
+@(private = "file")
 get_schemas :: proc(db: ^sqlite_db) -> ([]TableSchema, DATABASE_READ_ERROR) {
 	page_data, err := read_page(db, 1)
 	if err != PAGE_READ_ERROR.NONE {
@@ -477,6 +538,7 @@ get_schemas :: proc(db: ^sqlite_db) -> ([]TableSchema, DATABASE_READ_ERROR) {
 	return schemas[:], DATABASE_READ_ERROR.NONE
 }
 
+@(private = "file")
 read_column_int :: proc(data: []byte, offset: int, serial_type: u64) -> (i64, bool) {
 	switch serial_type {
 	case 1:
@@ -505,6 +567,7 @@ read_column_int :: proc(data: []byte, offset: int, serial_type: u64) -> (i64, bo
 	return 0, false
 }
 
+@(private = "file")
 parse_columns :: proc(sql: string) -> []string {
 	start := strings.index(sql, "(")
 	if start == -1 {return nil}
@@ -535,17 +598,10 @@ parse_columns :: proc(sql: string) -> []string {
 	return cols[:]
 }
 
-query_table :: proc(
-	db: ^sqlite_db,
-	table_name: string,
-) -> (
-	[]map[string]SqlValue,
-	[]string,
-	DATABASE_READ_ERROR,
-) {
+query_table :: proc(db: ^sqlite_db, table_name: string) -> QueryResult {
 	schemas, err := get_schemas(db)
 	if err != DATABASE_READ_ERROR.NONE {
-		return nil, nil, err
+		return QueryResult{err = err}
 	}
 	defer {
 		for s in schemas {
@@ -568,7 +624,7 @@ query_table :: proc(
 	}
 
 	if !found {
-		return nil, nil, DATABASE_READ_ERROR.NONE // Not found
+		return QueryResult{err = DATABASE_READ_ERROR.NONE} // Not found
 	}
 
 	// Parse columns
@@ -577,18 +633,18 @@ query_table :: proc(
 	// Read Data Page
 	page_data, pg_err := read_page(db, u32(target_schema.root_page))
 	if pg_err != PAGE_READ_ERROR.NONE {
-		return nil, columns, DATABASE_READ_ERROR.IO_ERROR
+		return QueryResult{columns = columns, err = DATABASE_READ_ERROR.IO_ERROR}
 	}
 	defer delete(page_data)
 
 	page_type := page_data[0]
 	if page_type != 0x0D {
 		// TODO: Handle Interior Pages
-		return nil, columns, DATABASE_READ_ERROR.NONE
+		return QueryResult{columns = columns, err = DATABASE_READ_ERROR.NONE}
 	}
 
 	num_cells := be_read_u16(page_data, 3)
-	rows := make([dynamic]map[string]SqlValue)
+	rows := make([dynamic]Row)
 	cell_ptr_offset := 8
 
 	for i := 0; i < int(num_cells); i += 1 {
@@ -606,7 +662,7 @@ query_table :: proc(
 		data_cursor := content_offset + int(header_len)
 
 		col_idx := 0
-		row := make(map[string]SqlValue)
+		row := make(Row)
 		row["_rowid_"] = i64(row_id)
 
 		for cursor < header_end {
@@ -654,5 +710,5 @@ query_table :: proc(
 		append(&rows, row)
 	}
 
-	return rows[:], columns, DATABASE_READ_ERROR.NONE
+	return QueryResult{rows = rows, columns = columns, err = DATABASE_READ_ERROR.NONE}
 }
