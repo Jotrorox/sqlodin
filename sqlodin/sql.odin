@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:testing"
 
 @(private = "file")
 SQLITE_MAGIC: [16]u8 = {
@@ -711,4 +712,99 @@ query_table :: proc(db: ^sqlite_db, table_name: string) -> QueryResult {
 	}
 
 	return QueryResult{rows = rows, columns = columns, err = DATABASE_READ_ERROR.NONE}
+}
+
+@(test)
+test_be_read_u16 :: proc(t: ^testing.T) {
+	data := []u8{0x01, 0x02}
+	val := be_read_u16(data, 0)
+	testing.expect(t, val == 0x0102, "Expected 0x0102")
+}
+
+@(test)
+test_be_read_u32 :: proc(t: ^testing.T) {
+	data := []u8{0x01, 0x02, 0x03, 0x04}
+	val := be_read_u32(data, 0)
+	testing.expect(t, val == 0x01020304, "Expected 0x01020304")
+}
+
+@(test)
+test_derive_page_size :: proc(t: ^testing.T) {
+	size, valid := derive_page_size(1)
+	testing.expect(t, valid == true, "Expected valid page size")
+	testing.expect(t, size == 65536, "Expected 65536")
+
+	size, valid = derive_page_size(512)
+	testing.expect(t, valid == true, "Expected valid page size")
+	testing.expect(t, size == 512, "Expected 512")
+
+	size, valid = derive_page_size(1024)
+	testing.expect(t, valid == true, "Expected valid page size")
+	testing.expect(t, size == 1024, "Expected 1024")
+
+	size, valid = derive_page_size(300)
+	testing.expect(t, valid == false, "Expected invalid page size")
+
+	size, valid = derive_page_size(513)
+	testing.expect(t, valid == false, "Expected invalid page size")
+}
+
+@(test)
+test_read_varint :: proc(t: ^testing.T) {
+	data1 := []u8{0x7F}
+	val, n := read_varint(data1, 0)
+	testing.expect(t, val == 127, "Expected 127")
+	testing.expect(t, n == 1, "Expected 1 byte read")
+
+	data2 := []u8{0x81, 0x00}
+	val, n = read_varint(data2, 0)
+	testing.expect(t, val == 128, "Expected 128")
+	testing.expect(t, n == 2, "Expected 2 bytes read")
+}
+
+@(test)
+test_serial_type_len :: proc(t: ^testing.T) {
+	testing.expect(t, serial_type_len(0) == 0, "Type 0 length should be 0")
+	testing.expect(t, serial_type_len(1) == 1, "Type 1 length should be 1")
+	testing.expect(t, serial_type_len(2) == 2, "Type 2 length should be 2")
+	testing.expect(t, serial_type_len(3) == 3, "Type 3 length should be 3")
+	testing.expect(t, serial_type_len(4) == 4, "Type 4 length should be 4")
+	testing.expect(t, serial_type_len(5) == 6, "Type 5 length should be 6")
+	testing.expect(t, serial_type_len(6) == 8, "Type 6 length should be 8")
+	testing.expect(t, serial_type_len(7) == 8, "Type 7 length should be 8")
+	testing.expect(t, serial_type_len(8) == 0, "Type 8 length should be 0")
+	testing.expect(t, serial_type_len(9) == 0, "Type 9 length should be 0")
+	testing.expect(t, serial_type_len(12) == 0, "Type 12 length should be 0")
+	testing.expect(t, serial_type_len(13) == 0, "Type 13 length should be 0")
+	testing.expect(t, serial_type_len(14) == 1, "Type 14 length should be 1")
+}
+
+@(test)
+test_header_parse :: proc(t: ^testing.T) {
+	header_data: [100]u8
+	for i := 0; i < 16; i += 1 {
+		header_data[i] = SQLITE_MAGIC[i]
+	}
+	// Set page size to 4096 (0x1000) at offset 16
+	header_data[16] = 0x10
+	header_data[17] = 0x00
+
+	header_ptr, err := header_parse(&header_data)
+	defer header_cleanup(header_ptr)
+
+	testing.expect(t, err == HEADER_PARSE_ERROR.NONE, "Expected no error parsing header")
+	testing.expect(t, header_ptr != nil, "Expected header pointer not to be nil")
+	if header_ptr != nil {
+		testing.expect(t, header_ptr.page_size == 4096, "Expected page size 4096")
+	}
+
+	// Test invalid magic
+	invalid_header: [100]u8
+	header_ptr_invalid, err_invalid := header_parse(&invalid_header)
+	testing.expect(
+		t,
+		err_invalid == HEADER_PARSE_ERROR.INVALID_HEADER,
+		"Expected invalid header error",
+	)
+	testing.expect(t, header_ptr_invalid == nil, "Expected nil header pointer")
 }
