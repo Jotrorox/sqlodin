@@ -24,12 +24,15 @@ main :: proc() {
 
 	fmt.println("Page size:", db_ptr^.page_size)
 
-	page_number: u32 = 0
-	page_data, page_read_err := sqlodin.read_page(db_ptr, page_number)
-	if page_read_err != sqlodin.PAGE_READ_ERROR.NONE {
-		fmt.println("Error reading page:", page_read_err)
+	tables, tables_err := sqlodin.get_table_names(db_ptr)
+	if tables_err != sqlodin.DATABASE_READ_ERROR.NONE {
+		fmt.println("Error reading tables:", tables_err)
 		return
 	}
+	defer delete(tables)
 
-	fmt.println("Page data:", page_data)
+	fmt.println("Tables:", tables)
+	for table in tables {
+		delete(table)
+	}
 }

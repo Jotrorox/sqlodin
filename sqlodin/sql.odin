@@ -3,6 +3,7 @@ package sqlodin
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strings"
 
 SQLITE_MAGIC: [16]u8 = {
 	0x53,
@@ -67,6 +68,13 @@ HEADER_PARSE_ERROR :: enum {
 	UNKNOWN_ERROR  = 2,
 	INVALID_DATA   = 3,
 	ALLOC_ERROR    = 4,
+}
+
+PAGE_READ_ERROR :: enum {
+	NONE,
+	FILE_NOT_FOUND,
+	READ_ERROR,
+	INVALID_PAGE_SIZE,
 }
 
 be_read_u16 :: #force_inline proc(bytes: []u8, offset: int) -> u16 {
@@ -192,16 +200,12 @@ open_db_file :: #force_inline proc(db_ptr: ^sqlite_db) -> (os.Handle, DATABASE_R
 	return file, DATABASE_READ_ERROR.NONE
 }
 
-PAGE_READ_ERROR :: enum {
-	NONE,
-	FILE_NOT_FOUND,
-	READ_ERROR,
-	INVALID_PAGE_SIZE,
-}
-
 read_page :: proc(db_ptr: ^sqlite_db, page_number: u32) -> ([]byte, PAGE_READ_ERROR) {
 	page_size := db_ptr^.page_size
-	page_offset := page_number * page_size + 100 // Offset because of header
+	if page_number < 1 {
+		return nil, PAGE_READ_ERROR.READ_ERROR
+	}
+	page_offset := i64(page_number - 1) * i64(page_size)
 	page_data := make([]byte, page_size)
 
 	file_handle, open_file_err := open_db_file(db_ptr)
@@ -210,7 +214,7 @@ read_page :: proc(db_ptr: ^sqlite_db, page_number: u32) -> ([]byte, PAGE_READ_ER
 		return nil, PAGE_READ_ERROR.FILE_NOT_FOUND
 	}
 
-	total_read, read_err := os.read_at(file_handle, page_data, i64(page_offset))
+	total_read, read_err := os.read_at(file_handle, page_data, page_offset)
 	if read_err != nil {
 		return nil, PAGE_READ_ERROR.READ_ERROR
 	}
@@ -261,4 +265,114 @@ read_file :: proc(file_path: string) -> (^sqlite_db, DATABASE_READ_ERROR) {
 
 	db_ptr.page_size = resolved_page_size
 	return db_ptr, DATABASE_READ_ERROR.NONE
+}
+
+read_varint :: proc(data: []byte, offset: int) -> (u64, int) {
+	val: u64 = 0
+	for i := 0; i < 8; i += 1 {
+		if offset + i >= len(data) {
+			return val, i
+		}
+		b := data[offset + i]
+		val = (val << 7) | u64(b & 0x7F)
+		if b < 0x80 {
+			return val, i + 1
+		}
+	}
+	if offset + 8 < len(data) {
+		val = (val << 8) | u64(data[offset + 8])
+		return val, 9
+	}
+	return val, 9
+}
+
+serial_type_len :: proc(serial_type: u64) -> u64 {
+	switch serial_type {
+	case 0, 8, 9:
+		return 0
+	case 1:
+		return 1
+	case 2:
+		return 2
+	case 3:
+		return 3
+	case 4:
+		return 4
+	case 5:
+		return 6
+	case 6, 7:
+		return 8
+	case:
+		if serial_type >= 12 {
+			if serial_type % 2 == 0 {
+				return (serial_type - 12) / 2
+			} else {
+				return (serial_type - 13) / 2
+			}
+		}
+	}
+	return 0
+}
+
+get_table_names :: proc(db: ^sqlite_db) -> ([]string, DATABASE_READ_ERROR) {
+	page_data, err := read_page(db, 1)
+	if err != PAGE_READ_ERROR.NONE {
+		return nil, DATABASE_READ_ERROR.IO_ERROR
+	}
+	defer delete(page_data)
+
+	header_offset := 100
+	page_type := page_data[header_offset]
+
+	// Only handling Leaf Table B-Tree (0x0D) for schema root
+	if page_type != 0x0D {
+		return nil, DATABASE_READ_ERROR.INVALID_FILE_FORMAT
+	}
+
+	num_cells := be_read_u16(page_data, header_offset + 3)
+	names := make([dynamic]string)
+	cell_ptr_offset := header_offset + 8
+
+	for i := 0; i < int(num_cells); i += 1 {
+		ptr := be_read_u16(page_data, cell_ptr_offset + i * 2)
+		cell_offset := int(ptr)
+
+		payload_size, ps_len := read_varint(page_data, cell_offset)
+		_, rid_len := read_varint(page_data, cell_offset + ps_len)
+		content_offset := cell_offset + ps_len + rid_len
+
+		header_len, hl_len := read_varint(page_data, content_offset)
+		header_end := content_offset + int(header_len)
+
+		cursor := content_offset + hl_len
+		data_cursor := content_offset + int(header_len)
+
+		col_idx := 0
+		is_table := false
+
+		for cursor < header_end {
+			serial_type, st_len := read_varint(page_data, cursor)
+			cursor += st_len
+			len_in_bytes := serial_type_len(serial_type)
+
+			if col_idx == 0 { 	// type column
+				if len_in_bytes > 0 {
+					val := string(page_data[data_cursor:data_cursor + int(len_in_bytes)])
+					if val == "table" {
+						is_table = true
+					}
+				}
+			} else if col_idx == 1 { 	// name column
+				if is_table && len_in_bytes > 0 {
+					val := string(page_data[data_cursor:data_cursor + int(len_in_bytes)])
+					append(&names, strings.clone(val))
+				}
+			}
+
+			data_cursor += int(len_in_bytes)
+			col_idx += 1
+		}
+	}
+
+	return names[:], DATABASE_READ_ERROR.NONE
 }
