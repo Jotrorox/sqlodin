@@ -351,7 +351,7 @@ get_table_names :: proc(db: ^sqlite_db) -> ([]string, DATABASE_READ_ERROR) {
 		ptr := be_read_u16(page_data, cell_ptr_offset + i * 2)
 		cell_offset := int(ptr)
 
-		payload_size, ps_len := read_varint(page_data, cell_offset)
+		_, ps_len := read_varint(page_data, cell_offset)
 		_, rid_len := read_varint(page_data, cell_offset + ps_len)
 		content_offset := cell_offset + ps_len + rid_len
 
@@ -478,7 +478,7 @@ get_schemas :: proc(db: ^sqlite_db) -> ([]TableSchema, DATABASE_READ_ERROR) {
 		cell_offset := int(ptr)
 
 		// Parse Cell
-		payload_size, ps_len := read_varint(page_data, cell_offset)
+		_, ps_len := read_varint(page_data, cell_offset)
 		_, rid_len := read_varint(page_data, cell_offset + ps_len)
 		content_offset := cell_offset + ps_len + rid_len
 
@@ -490,7 +490,7 @@ get_schemas :: proc(db: ^sqlite_db) -> ([]TableSchema, DATABASE_READ_ERROR) {
 
 		col_idx := 0
 		schema := TableSchema{}
-		valid := true
+		// valid := true
 
 		for cursor < header_end {
 			serial_type, st_len := read_varint(page_data, cursor)
@@ -651,7 +651,7 @@ query_table :: proc(db: ^sqlite_db, table_name: string) -> QueryResult {
 		ptr := be_read_u16(page_data, cell_ptr_offset + i * 2)
 		cell_offset := int(ptr)
 
-		payload_size, ps_len := read_varint(page_data, cell_offset)
+		_, ps_len := read_varint(page_data, cell_offset)
 		row_id, rid_len := read_varint(page_data, cell_offset + ps_len)
 		content_offset := cell_offset + ps_len + rid_len
 
