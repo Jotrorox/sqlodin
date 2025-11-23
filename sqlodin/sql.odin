@@ -376,3 +376,283 @@ get_table_names :: proc(db: ^sqlite_db) -> ([]string, DATABASE_READ_ERROR) {
 
 	return names[:], DATABASE_READ_ERROR.NONE
 }
+
+SqlNull :: struct {}
+
+SqlValue :: union {
+	SqlNull,
+	i64,
+	f64,
+	string,
+	[]byte,
+}
+
+TableSchema :: struct {
+	type:      string,
+	name:      string,
+	tbl_name:  string,
+	root_page: int,
+	sql:       string,
+}
+
+get_schemas :: proc(db: ^sqlite_db) -> ([]TableSchema, DATABASE_READ_ERROR) {
+	page_data, err := read_page(db, 1)
+	if err != PAGE_READ_ERROR.NONE {
+		return nil, DATABASE_READ_ERROR.IO_ERROR
+	}
+	defer delete(page_data)
+
+	header_offset := 100
+	page_type := page_data[header_offset]
+	if page_type != 0x0D {
+		return nil, DATABASE_READ_ERROR.INVALID_FILE_FORMAT
+	}
+
+	num_cells := be_read_u16(page_data, header_offset + 3)
+	schemas := make([dynamic]TableSchema)
+	cell_ptr_offset := header_offset + 8
+
+	for i := 0; i < int(num_cells); i += 1 {
+		ptr := be_read_u16(page_data, cell_ptr_offset + i * 2)
+		cell_offset := int(ptr)
+
+		// Parse Cell
+		payload_size, ps_len := read_varint(page_data, cell_offset)
+		_, rid_len := read_varint(page_data, cell_offset + ps_len)
+		content_offset := cell_offset + ps_len + rid_len
+
+		header_len, hl_len := read_varint(page_data, content_offset)
+		header_end := content_offset + int(header_len)
+
+		cursor := content_offset + hl_len
+		data_cursor := content_offset + int(header_len)
+
+		col_idx := 0
+		schema := TableSchema{}
+		valid := true
+
+		for cursor < header_end {
+			serial_type, st_len := read_varint(page_data, cursor)
+			cursor += st_len
+			len_in_bytes := serial_type_len(serial_type)
+
+			val: string
+			if len_in_bytes > 0 {
+				// We only care about string columns for schema parsing (type, name, tbl_name, sql)
+				// Rootpage is int (col 3)
+				if serial_type >= 12 && serial_type % 2 != 0 {
+					val = string(page_data[data_cursor:data_cursor + int(len_in_bytes)])
+				}
+			}
+
+			switch col_idx {
+			case 0:
+				// type
+				schema.type = strings.clone(val)
+			case 1:
+				// name
+				schema.name = strings.clone(val)
+			case 2:
+				// tbl_name
+				schema.tbl_name = strings.clone(val)
+			case 3:
+				// rootpage
+				// Rootpage is usually integer
+				int_val, _ := read_column_int(page_data, data_cursor, serial_type)
+				schema.root_page = int(int_val)
+			case 4:
+				// sql
+				schema.sql = strings.clone(val)
+			}
+
+			data_cursor += int(len_in_bytes)
+			col_idx += 1
+		}
+
+		if schema.type == "table" {
+			append(&schemas, schema)
+		}
+	}
+
+	return schemas[:], DATABASE_READ_ERROR.NONE
+}
+
+read_column_int :: proc(data: []byte, offset: int, serial_type: u64) -> (i64, bool) {
+	switch serial_type {
+	case 1:
+		return i64(i8(data[offset])), true
+	case 2:
+		return i64(i16(be_read_u16(data, offset))), true
+	case 3:
+		// 24-bit
+		val := (u32(data[offset]) << 16) | (u32(data[offset + 1]) << 8) | u32(data[offset + 2])
+		if (val & 0x800000) != 0 {
+			val |= 0xFF000000
+			return i64(i32(val)), true
+		}
+		return i64(val), true
+	case 4:
+		return i64(i32(be_read_u32(data, offset))), true
+	case 5:
+		return 0, false // 48-bit not impl
+	case 6:
+		return 0, false // 64-bit need be_read_u64
+	case 8:
+		return 0, true
+	case 9:
+		return 1, true
+	}
+	return 0, false
+}
+
+parse_columns :: proc(sql: string) -> []string {
+	start := strings.index(sql, "(")
+	if start == -1 {return nil}
+	end := strings.last_index(sql, ")")
+	if end == -1 || end <= start {return nil}
+
+	content := sql[start + 1:end]
+	parts := strings.split(content, ",")
+	defer delete(parts)
+
+	cols := make([dynamic]string)
+	for part in parts {
+		trimmed := strings.trim_space(part)
+		// Take first word
+		idx := strings.index(trimmed, " ")
+		if idx != -1 {
+			col_name := trimmed[:idx]
+			// Remove quotes if present
+			col_name = strings.trim(col_name, "\"`[]")
+			append(&cols, strings.clone(col_name))
+		} else {
+			col_name := strings.trim(trimmed, "\"`[]")
+			if len(col_name) > 0 {
+				append(&cols, strings.clone(col_name))
+			}
+		}
+	}
+	return cols[:]
+}
+
+query_table :: proc(
+	db: ^sqlite_db,
+	table_name: string,
+) -> (
+	[]map[string]SqlValue,
+	[]string,
+	DATABASE_READ_ERROR,
+) {
+	schemas, err := get_schemas(db)
+	if err != DATABASE_READ_ERROR.NONE {
+		return nil, nil, err
+	}
+	defer {
+		for s in schemas {
+			delete(s.type)
+			delete(s.name)
+			delete(s.tbl_name)
+			delete(s.sql)
+		}
+		delete(schemas)
+	}
+
+	target_schema: TableSchema
+	found := false
+	for s in schemas {
+		if s.name == table_name {
+			target_schema = s
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil, nil, DATABASE_READ_ERROR.NONE // Not found
+	}
+
+	// Parse columns
+	columns := parse_columns(target_schema.sql)
+
+	// Read Data Page
+	page_data, pg_err := read_page(db, u32(target_schema.root_page))
+	if pg_err != PAGE_READ_ERROR.NONE {
+		return nil, columns, DATABASE_READ_ERROR.IO_ERROR
+	}
+	defer delete(page_data)
+
+	page_type := page_data[0]
+	if page_type != 0x0D {
+		// TODO: Handle Interior Pages
+		return nil, columns, DATABASE_READ_ERROR.NONE
+	}
+
+	num_cells := be_read_u16(page_data, 3)
+	rows := make([dynamic]map[string]SqlValue)
+	cell_ptr_offset := 8
+
+	for i := 0; i < int(num_cells); i += 1 {
+		ptr := be_read_u16(page_data, cell_ptr_offset + i * 2)
+		cell_offset := int(ptr)
+
+		payload_size, ps_len := read_varint(page_data, cell_offset)
+		row_id, rid_len := read_varint(page_data, cell_offset + ps_len)
+		content_offset := cell_offset + ps_len + rid_len
+
+		header_len, hl_len := read_varint(page_data, content_offset)
+		header_end := content_offset + int(header_len)
+
+		cursor := content_offset + hl_len
+		data_cursor := content_offset + int(header_len)
+
+		col_idx := 0
+		row := make(map[string]SqlValue)
+		row["_rowid_"] = i64(row_id)
+
+		for cursor < header_end {
+			serial_type, st_len := read_varint(page_data, cursor)
+			cursor += st_len
+			len_in_bytes := serial_type_len(serial_type)
+
+			col_name := ""
+			if col_idx < len(columns) {
+				col_name = columns[col_idx]
+			} else {
+				col_name = fmt.tprintf("col_%d", col_idx)
+			}
+
+			// Read Value
+			if serial_type == 0 {
+				row[col_name] = SqlNull{}
+			} else if serial_type >= 1 && serial_type <= 6 {
+				// Integer
+				int_val, ok := read_column_int(page_data, data_cursor, serial_type)
+				if ok {
+					row[col_name] = int_val
+				}
+			} else if serial_type == 7 {
+				// Float
+				// TODO
+			} else if serial_type == 8 {
+				row[col_name] = i64(0)
+			} else if serial_type == 9 {
+				row[col_name] = i64(1)
+			} else if serial_type >= 12 {
+				// Blob or Text
+				is_text := (serial_type % 2) != 0
+				if is_text {
+					val := string(page_data[data_cursor:data_cursor + int(len_in_bytes)])
+					row[col_name] = strings.clone(val)
+				} else {
+					// Blob
+				}
+			}
+
+			data_cursor += int(len_in_bytes)
+			col_idx += 1
+		}
+		append(&rows, row)
+	}
+
+	return rows[:], columns, DATABASE_READ_ERROR.NONE
+}

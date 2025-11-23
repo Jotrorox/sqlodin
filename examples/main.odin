@@ -22,8 +22,6 @@ main :: proc() {
 		return
 	}
 
-	fmt.println("Page size:", db_ptr^.page_size)
-
 	tables, tables_err := sqlodin.get_table_names(db_ptr)
 	if tables_err != sqlodin.DATABASE_READ_ERROR.NONE {
 		fmt.println("Error reading tables:", tables_err)
@@ -33,6 +31,34 @@ main :: proc() {
 
 	fmt.println("Tables:", tables)
 	for table in tables {
+		fmt.println("Data for table:", table)
+		rows, cols, err := sqlodin.query_table(db_ptr, table)
+		if err != sqlodin.DATABASE_READ_ERROR.NONE {
+			fmt.println("Error querying table:", err)
+			delete(table)
+			continue
+		}
+
+		fmt.println("    Columns:", cols)
+		for row in rows {
+			fmt.println("   ", row)
+			for _, v in row {
+				#partial switch val in v {
+				case string:
+					delete(val)
+				case []byte:
+					delete(val)
+				}
+			}
+			delete(row)
+		}
+		delete(rows)
+
+		for col in cols {
+			delete(col)
+		}
+		delete(cols)
+
 		delete(table)
 	}
 }
