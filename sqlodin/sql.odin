@@ -203,7 +203,7 @@ header_cleanup :: #force_inline proc(header_ptr: ^sqlite_header) {
 }
 
 @(private = "file")
-open_db_file :: #force_inline proc(db_ptr: ^sqlite_db) -> (os.Handle, DATABASE_READ_ERROR) {
+open_db_file :: #force_inline proc(db_ptr: ^sqlite_db) -> (^os.File, DATABASE_READ_ERROR) {
 	file, open_file_err := os.open(db_ptr^.file_path)
 	if open_file_err != nil {
 		return file, DATABASE_READ_ERROR.FILE_NOT_FOUND
@@ -236,6 +236,14 @@ read_page :: proc(db_ptr: ^sqlite_db, page_number: u32) -> ([]byte, PAGE_READ_ER
 	}
 
 	return page_data, PAGE_READ_ERROR.NONE
+}
+
+@(private = "file")
+page_header_offset :: #force_inline proc(page_number: u32) -> int {
+	if page_number == 1 {
+		return 100
+	}
+	return 0
 }
 
 read :: proc {
@@ -599,6 +607,128 @@ parse_columns :: proc(sql: string) -> []string {
 	return cols[:]
 }
 
+@(private = "file")
+collect_table_leaf_pages :: proc(
+	db: ^sqlite_db,
+	page_number: u32,
+	leaf_pages: ^[dynamic]u32,
+) -> DATABASE_READ_ERROR {
+	page_data, pg_err := read_page(db, page_number)
+	if pg_err != PAGE_READ_ERROR.NONE {
+		return DATABASE_READ_ERROR.IO_ERROR
+	}
+	defer delete(page_data)
+
+	header_offset := page_header_offset(page_number)
+	page_type := page_data[header_offset]
+
+	switch page_type {
+	case 0x0D:
+		append(leaf_pages, page_number)
+		return DATABASE_READ_ERROR.NONE
+	case 0x05:
+		num_cells := be_read_u16(page_data, header_offset + 3)
+		right_most_page := be_read_u32(page_data, header_offset + 8)
+		cell_ptr_offset := header_offset + 12
+
+		for i := 0; i < int(num_cells); i += 1 {
+			ptr := be_read_u16(page_data, cell_ptr_offset + i * 2)
+			cell_offset := int(ptr)
+			child_page := be_read_u32(page_data, cell_offset)
+
+			if err := collect_table_leaf_pages(db, child_page, leaf_pages); err != DATABASE_READ_ERROR.NONE {
+				return err
+			}
+		}
+
+		if err := collect_table_leaf_pages(db, right_most_page, leaf_pages); err != DATABASE_READ_ERROR.NONE {
+			return err
+		}
+		return DATABASE_READ_ERROR.NONE
+	}
+
+	return DATABASE_READ_ERROR.INVALID_FILE_FORMAT
+}
+
+@(private = "file")
+parse_leaf_table_page_rows :: proc(
+	page_data: []byte,
+	page_number: u32,
+	columns: []string,
+) -> ([dynamic]Row, DATABASE_READ_ERROR) {
+	header_offset := page_header_offset(page_number)
+	page_type := page_data[header_offset]
+	if page_type != 0x0D {
+		return nil, DATABASE_READ_ERROR.INVALID_FILE_FORMAT
+	}
+
+	num_cells := be_read_u16(page_data, header_offset + 3)
+	rows := make([dynamic]Row)
+	cell_ptr_offset := header_offset + 8
+
+	for i := 0; i < int(num_cells); i += 1 {
+		ptr := be_read_u16(page_data, cell_ptr_offset + i * 2)
+		cell_offset := int(ptr)
+
+		_, ps_len := read_varint(page_data, cell_offset)
+		row_id, rid_len := read_varint(page_data, cell_offset + ps_len)
+		content_offset := cell_offset + ps_len + rid_len
+
+		header_len, hl_len := read_varint(page_data, content_offset)
+		header_end := content_offset + int(header_len)
+
+		cursor := content_offset + hl_len
+		data_cursor := content_offset + int(header_len)
+
+		col_idx := 0
+		row := make(Row)
+		row["_rowid_"] = i64(row_id)
+
+		for cursor < header_end {
+			serial_type, st_len := read_varint(page_data, cursor)
+			cursor += st_len
+			len_in_bytes := serial_type_len(serial_type)
+
+			col_name := ""
+			if col_idx < len(columns) {
+				col_name = columns[col_idx]
+			} else {
+				col_name = fmt.tprintf("col_%d", col_idx)
+			}
+
+			if serial_type == 0 {
+				row[col_name] = SqlNull{}
+			} else if serial_type >= 1 && serial_type <= 6 {
+				int_val, ok := read_column_int(page_data, data_cursor, serial_type)
+				if ok {
+					row[col_name] = int_val
+				}
+			} else if serial_type == 7 {
+				// TODO
+			} else if serial_type == 8 {
+				row[col_name] = i64(0)
+			} else if serial_type == 9 {
+				row[col_name] = i64(1)
+			} else if serial_type >= 12 {
+				is_text := (serial_type % 2) != 0
+				if is_text {
+					val := string(page_data[data_cursor:data_cursor + int(len_in_bytes)])
+					row[col_name] = strings.clone(val)
+				} else {
+					// Blob
+				}
+			}
+
+			data_cursor += int(len_in_bytes)
+			col_idx += 1
+		}
+
+		append(&rows, row)
+	}
+
+	return rows, DATABASE_READ_ERROR.NONE
+}
+
 query_table :: proc(db: ^sqlite_db, table_name: string) -> QueryResult {
 	schemas, err := get_schemas(db)
 	if err != DATABASE_READ_ERROR.NONE {
@@ -631,87 +761,131 @@ query_table :: proc(db: ^sqlite_db, table_name: string) -> QueryResult {
 	// Parse columns
 	columns := parse_columns(target_schema.sql)
 
-	// Read Data Page
-	page_data, pg_err := read_page(db, u32(target_schema.root_page))
-	if pg_err != PAGE_READ_ERROR.NONE {
-		return QueryResult{columns = columns, err = DATABASE_READ_ERROR.IO_ERROR}
-	}
-	defer delete(page_data)
+	leaf_pages := make([dynamic]u32)
+	defer delete(leaf_pages)
 
-	page_type := page_data[0]
-	if page_type != 0x0D {
-		// TODO: Handle Interior Pages
-		return QueryResult{columns = columns, err = DATABASE_READ_ERROR.NONE}
+	if err := collect_table_leaf_pages(db, u32(target_schema.root_page), &leaf_pages); err != DATABASE_READ_ERROR.NONE {
+		return QueryResult{columns = columns, err = err}
 	}
 
-	num_cells := be_read_u16(page_data, 3)
 	rows := make([dynamic]Row)
-	cell_ptr_offset := 8
-
-	for i := 0; i < int(num_cells); i += 1 {
-		ptr := be_read_u16(page_data, cell_ptr_offset + i * 2)
-		cell_offset := int(ptr)
-
-		_, ps_len := read_varint(page_data, cell_offset)
-		row_id, rid_len := read_varint(page_data, cell_offset + ps_len)
-		content_offset := cell_offset + ps_len + rid_len
-
-		header_len, hl_len := read_varint(page_data, content_offset)
-		header_end := content_offset + int(header_len)
-
-		cursor := content_offset + hl_len
-		data_cursor := content_offset + int(header_len)
-
-		col_idx := 0
-		row := make(Row)
-		row["_rowid_"] = i64(row_id)
-
-		for cursor < header_end {
-			serial_type, st_len := read_varint(page_data, cursor)
-			cursor += st_len
-			len_in_bytes := serial_type_len(serial_type)
-
-			col_name := ""
-			if col_idx < len(columns) {
-				col_name = columns[col_idx]
-			} else {
-				col_name = fmt.tprintf("col_%d", col_idx)
+	for page_number in leaf_pages {
+		page_data, pg_err := read_page(db, page_number)
+		if pg_err != PAGE_READ_ERROR.NONE {
+			for row in rows {
+				delete(row)
 			}
-
-			// Read Value
-			if serial_type == 0 {
-				row[col_name] = SqlNull{}
-			} else if serial_type >= 1 && serial_type <= 6 {
-				// Integer
-				int_val, ok := read_column_int(page_data, data_cursor, serial_type)
-				if ok {
-					row[col_name] = int_val
-				}
-			} else if serial_type == 7 {
-				// Float
-				// TODO
-			} else if serial_type == 8 {
-				row[col_name] = i64(0)
-			} else if serial_type == 9 {
-				row[col_name] = i64(1)
-			} else if serial_type >= 12 {
-				// Blob or Text
-				is_text := (serial_type % 2) != 0
-				if is_text {
-					val := string(page_data[data_cursor:data_cursor + int(len_in_bytes)])
-					row[col_name] = strings.clone(val)
-				} else {
-					// Blob
-				}
-			}
-
-			data_cursor += int(len_in_bytes)
-			col_idx += 1
+			delete(rows)
+			return QueryResult{columns = columns, err = DATABASE_READ_ERROR.IO_ERROR}
 		}
-		append(&rows, row)
+		page_rows, err := parse_leaf_table_page_rows(page_data, page_number, columns)
+		delete(page_data)
+		if err != DATABASE_READ_ERROR.NONE {
+			for row in rows {
+				delete(row)
+			}
+			delete(rows)
+			return QueryResult{columns = columns, err = err}
+		}
+		for row in page_rows {
+			append(&rows, row)
+		}
+		delete(page_rows)
 	}
 
 	return QueryResult{rows = rows, columns = columns, err = DATABASE_READ_ERROR.NONE}
+}
+
+@(private = "file")
+put_be_u16 :: #force_inline proc(data: []u8, offset: int, value: u16) {
+	data[offset] = u8(value >> 8)
+	data[offset + 1] = u8(value)
+}
+
+@(private = "file")
+put_be_u32 :: #force_inline proc(data: []u8, offset: int, value: u32) {
+	data[offset] = u8(value >> 24)
+	data[offset + 1] = u8(value >> 16)
+	data[offset + 2] = u8(value >> 8)
+	data[offset + 3] = u8(value)
+}
+
+@(private = "file")
+append_small_varint :: #force_inline proc(buf: ^[dynamic]u8, value: u64) {
+	append(buf, u8(value))
+}
+
+@(private = "file")
+append_string_bytes :: proc(buf: ^[dynamic]u8, value: string) {
+	for b in transmute([]u8)value {
+		append(buf, b)
+	}
+}
+
+@(private = "file")
+write_record_leaf_cell :: proc(
+	page: []u8,
+	page_number: u32,
+	row_id: u64,
+	record: []u8,
+	cell_index: int,
+) {
+	header_offset := page_header_offset(page_number)
+	cell_len := 2 + len(record)
+	cell_offset := len(page) - cell_len
+
+	append_offset := cell_offset
+	page[append_offset] = u8(len(record))
+	append_offset += 1
+	page[append_offset] = u8(row_id)
+	append_offset += 1
+	mem.copy(raw_data(page[append_offset:]), raw_data(record), len(record))
+
+	put_be_u16(page, header_offset + 3, 1)
+	put_be_u16(page, header_offset + 5, u16(cell_offset))
+	put_be_u16(page, header_offset + 8 + cell_index * 2, u16(cell_offset))
+}
+
+@(private = "file")
+build_table_leaf_record :: proc(id: i64, name: string) -> [dynamic]u8 {
+	record := make([dynamic]u8)
+
+	if id == 1 {
+		append_small_varint(&record, 3)
+		append_small_varint(&record, 9)
+	} else {
+		append_small_varint(&record, 3)
+		append_small_varint(&record, 1)
+	}
+
+	append_small_varint(&record, 13 + 2 * u64(len(name)))
+
+	if id != 1 {
+		append(&record, u8(id))
+	}
+	append_string_bytes(&record, name)
+
+	return record
+}
+
+@(private = "file")
+build_schema_record :: proc(root_page: u32, sql: string) -> [dynamic]u8 {
+	record := make([dynamic]u8)
+
+	append_small_varint(&record, 6)
+	append_small_varint(&record, 23)
+	append_small_varint(&record, 23)
+	append_small_varint(&record, 23)
+	append_small_varint(&record, 1)
+	append_small_varint(&record, 13 + 2 * u64(len(sql)))
+
+	append_string_bytes(&record, "table")
+	append_string_bytes(&record, "users")
+	append_string_bytes(&record, "users")
+	append(&record, u8(root_page))
+	append_string_bytes(&record, sql)
+
+	return record
 }
 
 @(test)
@@ -807,4 +981,89 @@ test_header_parse :: proc(t: ^testing.T) {
 		"Expected invalid header error",
 	)
 	testing.expect(t, header_ptr_invalid == nil, "Expected nil header pointer")
+}
+
+@(test)
+test_query_table_handles_interior_root_pages :: proc(t: ^testing.T) {
+	db_path := fmt.tprintf("/tmp/sqlodin_interior_root_%d.sqlite", os.get_pid())
+	defer {
+		os.remove(db_path)
+	}
+
+	file, create_err := os.create(db_path)
+	testing.expect(t, create_err == nil, "Expected test database file to be created")
+	if create_err != nil || file == nil {
+		return
+	}
+	defer os.close(file)
+
+	page_size := 512
+	page1 := make([]u8, page_size)
+	page2 := make([]u8, page_size)
+	page3 := make([]u8, page_size)
+	page4 := make([]u8, page_size)
+	defer delete(page1)
+	defer delete(page2)
+	defer delete(page3)
+	defer delete(page4)
+
+	mem.copy(raw_data(page1[:len(SQLITE_MAGIC)]), raw_data(SQLITE_MAGIC[:]), len(SQLITE_MAGIC))
+	put_be_u16(page1, 16, u16(page_size))
+	put_be_u32(page1, 28, 4)
+
+	page1[100] = 0x0D
+	schema_sql := "CREATE TABLE users (id INT, name TEXT)"
+	schema_record := build_schema_record(2, schema_sql)
+	write_record_leaf_cell(page1, 1, 1, schema_record[:], 0)
+	delete(schema_record)
+
+	page2[0] = 0x05
+	put_be_u16(page2, 3, 1)
+	put_be_u16(page2, 5, 507)
+	put_be_u32(page2, 8, 4)
+	put_be_u16(page2, 12, 507)
+	put_be_u32(page2, 507, 3)
+	page2[511] = 1
+
+	page3[0] = 0x0D
+	row1_record := build_table_leaf_record(1, "Alice")
+	write_record_leaf_cell(page3, 3, 1, row1_record[:], 0)
+	delete(row1_record)
+
+	page4[0] = 0x0D
+	row2_record := build_table_leaf_record(2, "Bob")
+	write_record_leaf_cell(page4, 4, 2, row2_record[:], 0)
+	delete(row2_record)
+
+	total_written, write_err := os.write(file, page1)
+	testing.expect(t, write_err == nil && total_written == len(page1), "Expected page 1 to be written")
+	total_written, write_err = os.write(file, page2)
+	testing.expect(t, write_err == nil && total_written == len(page2), "Expected page 2 to be written")
+	total_written, write_err = os.write(file, page3)
+	testing.expect(t, write_err == nil && total_written == len(page3), "Expected page 3 to be written")
+	total_written, write_err = os.write(file, page4)
+	testing.expect(t, write_err == nil && total_written == len(page4), "Expected page 4 to be written")
+
+	db_ptr, db_err := read_file(db_path)
+	testing.expect(t, db_err == DATABASE_READ_ERROR.NONE, "Expected database header to be readable")
+	if db_ptr == nil {
+		return
+	}
+	defer mem.free(db_ptr)
+
+	result := query_table(db_ptr, "users")
+	defer destroy_query_result(result)
+
+	testing.expect(t, result.err == DATABASE_READ_ERROR.NONE, "Expected query to succeed")
+	testing.expect(t, len(result.rows) == 2, "Expected two rows from interior-root table")
+
+	row1_id, ok1 := row_get_int(result.rows[0], "id")
+	testing.expect(t, ok1 && row1_id == 1, "Expected first row id to be 1")
+	row1_name, ok2 := row_get_str(result.rows[0], "name")
+	testing.expect(t, ok2 && row1_name == "Alice", "Expected first row name to be Alice")
+
+	row2_id, ok3 := row_get_int(result.rows[1], "id")
+	testing.expect(t, ok3 && row2_id == 2, "Expected second row id to be 2")
+	row2_name, ok4 := row_get_str(result.rows[1], "name")
+	testing.expect(t, ok4 && row2_name == "Bob", "Expected second row name to be Bob")
 }
