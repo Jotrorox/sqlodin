@@ -577,33 +577,230 @@ read_column_int :: proc(data: []byte, offset: int, serial_type: u64) -> (i64, bo
 }
 
 @(private = "file")
-parse_columns :: proc(sql: string) -> []string {
+ascii_is_space :: #force_inline proc(ch: byte) -> bool {
+	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
+}
+
+@(private = "file")
+ascii_is_alpha :: #force_inline proc(ch: byte) -> bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+}
+
+@(private = "file")
+ascii_is_digit :: #force_inline proc(ch: byte) -> bool {
+	return ch >= '0' && ch <= '9'
+}
+
+@(private = "file")
+ascii_is_ident_char :: #force_inline proc(ch: byte) -> bool {
+	return ascii_is_alpha(ch) || ascii_is_digit(ch) || ch == '_'
+}
+
+@(private = "file")
+ascii_lower :: #force_inline proc(ch: byte) -> byte {
+	if ch >= 'A' && ch <= 'Z' {
+		return ch + ('a' - 'A')
+	}
+	return ch
+}
+
+@(private = "file")
+consume_sql_string :: proc(sql: string, start: int, quote: byte) -> int {
+	i := start + 1
+	for i < len(sql) {
+		if sql[i] == quote {
+			if i + 1 < len(sql) && sql[i + 1] == quote {
+				i += 2
+				continue
+			}
+			return i
+		}
+		i += 1
+	}
+	return len(sql) - 1
+}
+
+@(private = "file")
+consume_sql_bracket_identifier :: proc(sql: string, start: int) -> int {
+	i := start + 1
+	for i < len(sql) {
+		if sql[i] == ']' {
+			return i
+		}
+		i += 1
+	}
+	return len(sql) - 1
+}
+
+@(private = "file")
+extract_definition_list :: proc(sql: string) -> string {
 	start := strings.index(sql, "(")
-	if start == -1 {return nil}
-	end := strings.last_index(sql, ")")
-	if end == -1 || end <= start {return nil}
+	if start == -1 {
+		return ""
+	}
 
-	content := sql[start + 1:end]
-	parts := strings.split(content, ",")
-	defer delete(parts)
-
-	cols := make([dynamic]string)
-	for part in parts {
-		trimmed := strings.trim_space(part)
-		// Take first word
-		idx := strings.index(trimmed, " ")
-		if idx != -1 {
-			col_name := trimmed[:idx]
-			// Remove quotes if present
-			col_name = strings.trim(col_name, "\"`[]")
-			append(&cols, strings.clone(col_name))
-		} else {
-			col_name := strings.trim(trimmed, "\"`[]")
-			if len(col_name) > 0 {
-				append(&cols, strings.clone(col_name))
+	depth := 0
+	for i := start; i < len(sql); i += 1 {
+		switch sql[i] {
+		case '\'', '"', '`':
+			i = consume_sql_string(sql, i, sql[i])
+		case '[':
+			i = consume_sql_bracket_identifier(sql, i)
+		case '(':
+			depth += 1
+		case ')':
+			depth -= 1
+			if depth == 0 {
+				return sql[start + 1:i]
 			}
 		}
 	}
+
+	return ""
+}
+
+@(private = "file")
+split_top_level_sql_items :: proc(content: string) -> []string {
+	items := make([dynamic]string)
+	item_start := 0
+	depth := 0
+
+	for i := 0; i < len(content); i += 1 {
+		switch content[i] {
+		case '\'', '"', '`':
+			i = consume_sql_string(content, i, content[i])
+		case '[':
+			i = consume_sql_bracket_identifier(content, i)
+		case '(':
+			depth += 1
+		case ')':
+			if depth > 0 {
+				depth -= 1
+			}
+		case ',':
+			if depth == 0 {
+				item := strings.trim_space(content[item_start:i])
+				if len(item) > 0 {
+					append(&items, item)
+				}
+				item_start = i + 1
+			}
+		}
+	}
+
+	if item_start < len(content) {
+		item := strings.trim_space(content[item_start:])
+		if len(item) > 0 {
+			append(&items, item)
+		}
+	}
+
+	return items[:]
+}
+
+@(private = "file")
+read_unquoted_sql_token :: proc(definition: string, start: int) -> (string, int) {
+	i := start
+	for i < len(definition) && ascii_is_ident_char(definition[i]) {
+		i += 1
+	}
+	return definition[start:i], i
+}
+
+@(private = "file")
+read_quoted_sql_identifier :: proc(definition: string, start: int) -> (string, int, bool) {
+	if start >= len(definition) {
+		return "", start, false
+	}
+
+	switch definition[start] {
+	case '"', '`':
+		end := consume_sql_string(definition, start, definition[start])
+		if end <= start {
+			return "", start, false
+		}
+		return definition[start + 1:end], end + 1, true
+	case '[':
+		end := consume_sql_bracket_identifier(definition, start)
+		if end <= start {
+			return "", start, false
+		}
+		return definition[start + 1:end], end + 1, true
+	}
+
+	return "", start, false
+}
+
+@(private = "file")
+first_sql_keyword_is :: proc(definition: string, keyword: string) -> bool {
+	i := 0
+	for i < len(definition) && ascii_is_space(definition[i]) {
+		i += 1
+	}
+	if i >= len(definition) {
+		return false
+	}
+
+	token, token_end := read_unquoted_sql_token(definition, i)
+	if len(token) == 0 || len(token) != len(keyword) {
+		return false
+	}
+	for idx := 0; idx < len(keyword); idx += 1 {
+		if ascii_lower(token[idx]) != keyword[idx] {
+			return false
+		}
+	}
+	return token_end == len(definition) || ascii_is_space(definition[token_end]) || definition[token_end] == '('
+}
+
+@(private = "file")
+parse_column_name :: proc(definition: string) -> (string, bool) {
+	if first_sql_keyword_is(definition, "constraint") ||
+		first_sql_keyword_is(definition, "primary") ||
+		first_sql_keyword_is(definition, "foreign") ||
+		first_sql_keyword_is(definition, "unique") ||
+		first_sql_keyword_is(definition, "check") {
+		return "", false
+	}
+
+	i := 0
+	for i < len(definition) && ascii_is_space(definition[i]) {
+		i += 1
+	}
+	if i >= len(definition) {
+		return "", false
+	}
+
+	if name, next, ok := read_quoted_sql_identifier(definition, i); ok {
+		_ = next
+		return name, len(name) > 0
+	}
+
+	name, _ := read_unquoted_sql_token(definition, i)
+	if len(name) == 0 {
+		return "", false
+	}
+
+	return name, true
+}
+
+@(private = "file")
+parse_columns :: proc(sql: string) -> []string {
+	content := extract_definition_list(sql)
+	if len(content) == 0 {
+		return nil
+	}
+
+	items := split_top_level_sql_items(content)
+	defer delete(items)
+
+	cols := make([dynamic]string)
+	for item in items {
+		if col_name, ok := parse_column_name(item); ok {
+			append(&cols, strings.clone(col_name))
+		}
+	}
+
 	return cols[:]
 }
 
@@ -934,6 +1131,52 @@ test_read_varint :: proc(t: ^testing.T) {
 	val, n = read_varint(data2, 0)
 	testing.expect(t, val == 128, "Expected 128")
 	testing.expect(t, n == 2, "Expected 2 bytes read")
+}
+
+@(test)
+test_parse_columns_handles_nested_expressions_and_constraints :: proc(t: ^testing.T) {
+	sql := `CREATE TABLE users (
+		id INTEGER PRIMARY KEY,
+		email TEXT NOT NULL,
+		name TEXT DEFAULT (trim('last, first')),
+		slug TEXT GENERATED ALWAYS AS (lower(name || ',' || email)) STORED,
+		score INTEGER CHECK (score IN (1, 2, 3)),
+		CONSTRAINT users_email_unique UNIQUE (email),
+		PRIMARY KEY (id)
+	)`
+
+	columns := parse_columns(sql)
+	defer {
+		for column in columns {
+			delete(column)
+		}
+		delete(columns)
+	}
+
+	testing.expect(t, len(columns) == 5, "Expected only table columns to be returned")
+	testing.expect(t, columns[0] == "id", "Expected first column to be id")
+	testing.expect(t, columns[1] == "email", "Expected second column to be email")
+	testing.expect(t, columns[2] == "name", "Expected third column to be name")
+	testing.expect(t, columns[3] == "slug", "Expected fourth column to be slug")
+	testing.expect(t, columns[4] == "score", "Expected fifth column to be score")
+}
+
+@(test)
+test_parse_columns_handles_quoted_identifiers :: proc(t: ^testing.T) {
+	sql := "CREATE TABLE weird ([select] TEXT, \"two words\" INTEGER DEFAULT (1), `tick-name` BLOB)"
+
+	columns := parse_columns(sql)
+	defer {
+		for column in columns {
+			delete(column)
+		}
+		delete(columns)
+	}
+
+	testing.expect(t, len(columns) == 3, "Expected three quoted column names")
+	testing.expect(t, columns[0] == "select", "Expected bracket-quoted identifier")
+	testing.expect(t, columns[1] == "two words", "Expected double-quoted identifier")
+	testing.expect(t, columns[2] == "tick-name", "Expected backtick-quoted identifier")
 }
 
 @(test)
